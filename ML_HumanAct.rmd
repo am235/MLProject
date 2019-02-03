@@ -1,0 +1,195 @@
+---
+title: "Practical Machine Learning - Human Activities Recognition"
+author: "Andy Majumdar"
+date: "2 February 2019"
+output: html_document
+---
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE,fig.width=12,fig.align = "center",
+                      fig.path = "README_figs/README-")
+```
+
+
+## Human Activities Research
+
+This human activity recognition research has traditionally focused on discriminating between different activities, i.e. to predict "which" activity was performed at a specific point in time (like with the Daily Living Activities dataset above). The approach proposed for the Weight Lifting Exercises dataset is to investigate "how (well)" an activity was performed by the wearer. 
+
+Quality of execution is defined after investigating three aspects that pertain to qualitative activity recognition: the problem of specifying correct execution, the automatic and robust detection of execution mistakes, and how to provide feedback on the quality of execution to the user. Both on-body sensing approach and "ambient sensing approach" (by using Microsoft Kinect - dataset still unavailable) are used.
+
+Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: 
+* exactly according to the specification (Class A), 
+* throwing the elbows to the front (Class B), 
+* lifting the dumbbell only halfway (Class C), 
+* lowering the dumbbell only halfway (Class D) and 
+* throwing the hips to the front (Class E).
+
+Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes. Participants were supervised by an experienced weight lifter to make sure the execution complied to the manner they were supposed to simulate. The exercises were performed by six male participants aged between 20-28 years, with little weight lifting experience. 
+
+
+```{r LoadLib, echo=FALSE, results='hide'}
+
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(rattle)
+library(mlbench)
+library(rpart)
+library(gbm)
+library(parallel)
+library(doParallel)
+
+set.seed(12345)
+```
+
+## Loading the datasets
+
+The datasets are loaded from the given url given in the problems:
+
+```{r readURL}
+trainUrl <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testUrl <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+training <- read.csv(url(trainUrl), na.strings=c("NA","#DIV/0!",""))
+testing <- read.csv(url(testUrl), na.strings=c("NA","#DIV/0!",""))
+
+cluster <- makeCluster(detectCores() - 1) 
+registerDoParallel(cluster)
+```
+
+## Create training and validation dataset and cleaning 
+
+70% of the training dataset is used for training model and rest for cross-validations.The accuracy of the cross validation is important to choose the model.
+
+```{r TestTrainPart}
+inTrain <- createDataPartition(y=training$classe, p=0.7, list=FALSE)
+myTraining <- training[inTrain, ]; myTesting <- training[-inTrain, ]
+dim(myTraining); dim(myTesting)
+```
+160 variables can be way too many for us and first we are going to cleanup the data
+
+We will run the dataset two identify redundant zero variables and reduce the number of variables. All classe and particpiants have sufficient observations inside them.
+
+```{r}
+nzvTraining <- nearZeroVar(myTraining, saveMetrics=TRUE)
+trainingSub <- myTraining[,(nzvTraining$nzv==FALSE)&(nzvTraining$zeroVar==FALSE)]
+ncol(trainingSub)
+```
+
+Now the above is 130 variables after removing the zero variances and near zero variances. They have very few unique values relative to the number of samples and the ratio of the frequency of the most common value to the frequency of the second most common value is large. 
+The first few columns like timestamp etc. are removed as they are not considered the influencing variables.
+```{r}
+trainingSub <- trainingSub[,7:length(colnames(trainingSub))]
+```
+
+Now remove variables with more than 20% NAs in their values. 
+```{r}
+miss <- colSums(is.na(trainingSub))
+miss_prec <- miss/nrow(trainingSub)*100
+col_miss <- names(miss_prec[miss_prec>20])
+
+trainingSub <- trainingSub[,!(names(trainingSub) %in% col_miss)]
+keepCols <- colnames(trainingSub[, -53]) #remove classe as it's not contained in testing
+testingSub <- myTesting[keepCols] #keep only variables in testing
+dim(trainingSub); dim(testingSub) #trainingSub will have 1 more variable - classe
+any(colSums(is.na(trainingSub)>0) > 0)
+```
+
+As evident that all the variables now in the training set, have 100% complete. There is no need for any imputing.Phew.
+
+## Exploratory Data Analysis
+Picked up some of the random variables and see how the distribution indicate about the influence on the class variable.
+
+```{r echo=FALSE}
+table(myTraining$classe) 
+prop.table(table(myTraining$classe)) 
+prop.table(table(myTraining$user_name)) 
+prop.table(table(myTraining$user_name,myTraining$classe),2) 
+```
+Adelmo & Jeremy seems to be doing better than others based on all the observations.All the classes have sufficient observations.
+
+
+```{r}
+p1 <- qplot(log(roll_belt), data = myTraining, binwidth=2, fill = classe, show.legend = FALSE)
+p2 <- qplot(log(magnet_dumbbell_y), data = trainingSub, binwidth=2, fill = classe,show.legend = FALSE)
+p3 <- qplot(log(pitch_forearm), data = trainingSub,binwidth=2,  fill = classe,show.legend = FALSE)
+p4 <- qplot(log(accel_forearm_x), data = trainingSub, binwidth=2, fill = classe)
+
+grid.arrange(p1, p2, p3, p4, nrow = 1)
+```
+
+
+Using the log have better visibility on the distributions on a chart.Higher the values are, the probability for being categorized as A increases.
+There is less overlap of class determination for roll_belt and magnet_dumbbell_y. Same is not true for pitch_forearm and accel_forearm_x.
+
+
+## Principal Component Analysis
+
+The PCA is useful to even help us doing the feature selection and provide an window for any preprocessing requirement in the subsequent steps where different models are selected.
+```{r}
+prin_train <- prcomp(trainingSub[keepCols], scale. = T)
+std_dev <- prin_train$sdev
+pr_var <- std_dev^2
+prop_varex <- pr_var/sum(pr_var)
+# Simple plot b/w Principal Components and Variance.
+plot(cumsum(prop_varex), xlab = "Principal Component", 
+     ylab = "Cumulative Proportion of Variance Explained", type = "b")
+```
+
+So around 15 variables explain the 80% of variance. For 90% variance 20-25 variables are useful. We can see if PCA should be included later.
+We can also use the recursive feature elimination to identify key features.
+
+## Building Models
+We will build 3 different models
+* Decision Tree
+* Stochastic Gradient Boosting
+* Random Forest
+
+We expect to have more accuracy and less interpretability as we perform the modelling. We can also look into the key features. 
+
+### 1   Decision Tree
+```{r}
+system.time(model_dt <- rpart(classe ~ ., data = trainingSub, method="class"))
+fancyRpartPlot(model_dt, cex=0.7)   ##Graph 2
+prediction <- predict(model_dt, testingSub, type = "class")
+confusionMatrix(prediction, myTesting$classe)
+```
+There is 72% accuracy with the decision tree.The 
+
+### 2   Stochasitic Gradient Boosting
+```{r}
+control <- trainControl(method = "repeatedcv", repeats = 3,verboseIter=FALSE, number=5, allowParallel = TRUE)
+```
+The random search will help curbing any biases. Number of cross validations is minimal for better performance.We will use the parallel processing to try to generate faster results for gbm and Random Forest.
+
+```{r}
+system.time(model_gbm <- train(classe ~.,method="gbm",trControl = control,data=trainingSub,verbose = FALSE))
+ggplot(model_gbm)
+model_gbm$finalModel
+plot(varImp(object=model_gbm),main="GBM - Variable Importance")
+prediction_gbm <- predict(model_gbm, testingSub, type = "raw")
+confusionMatrix(prediction_gbm, myTesting$classe)
+```
+
+More than 95% accuracy - This is a great improvement over decision tree.
+But this takes a lot of time to complete and more than random forest below. XGBoost is a faster implementation of gbm but not included here. Also we have added provision for parallel processing which reduced the running time by 70% (YESSS!!)
+
+### 3   Random Forest
+Number of trees reduced to 100 to have faster running with 10 fold cross validations. Parallel processing is also allowed. 
+```{r}
+control <- trainControl(method = "repeatedcv", repeats = 3,verboseIter=FALSE, number=10,search="random")
+system.time(model_df <- train(classe ~.,method="rf",ntree = 100,data=trainingSub,trControl = control,verbose = FALSE,allowParallel = TRUE))
+ggplot(model_df)
+model_df$finalModel
+plot(varImp(object=model_df),main="RF - Variable Importance")
+prediction_df <- predict(model_df, testingSub, type = "raw")
+confusionMatrix(prediction_df, myTesting$classe)
+```
+
+The preprcess of PCA if included reduced the accuracy to 97% from 99%. That is why it is not included.
+
+## Predicting the Test dataset with Random Forest
+```{r}
+final_pred <- predict(model_df, testing[keepCols], type = "raw")
+final_pred
+```
